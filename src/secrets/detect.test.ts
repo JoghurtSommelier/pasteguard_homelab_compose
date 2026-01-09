@@ -182,6 +182,197 @@ describe("detectSecrets", () => {
   });
 });
 
+// Test data for new secret types
+const openaiApiKey = "sk-proj-abc123def456ghi789jkl012mno345pqr678stu901vwx";
+const awsAccessKey = "AKIAIOSFODNN7EXAMPLE";
+const githubToken = "ghp_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx1234";
+const githubOAuthToken = "gho_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx5678";
+const jwtToken =
+  "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkpvaG4gRG9lIiwiaWF0IjoxNTE2MjM5MDIyfQ.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c";
+const bearerToken = "Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9abcdefghijk";
+
+describe("detectSecrets - API Keys", () => {
+  const apiKeyConfig: SecretsDetectionConfig = {
+    ...defaultConfig,
+    entities: ["API_KEY_OPENAI", "API_KEY_AWS", "API_KEY_GITHUB"],
+  };
+
+  test("detects OpenAI API key", () => {
+    const text = `My API key is ${openaiApiKey}`;
+    const result = detectSecrets(text, apiKeyConfig);
+    expect(result.detected).toBe(true);
+    expect(result.matches).toHaveLength(1);
+    expect(result.matches[0].type).toBe("API_KEY_OPENAI");
+    expect(result.matches[0].count).toBe(1);
+    expect(result.redactions).toBeDefined();
+    expect(result.redactions?.[0].type).toBe("API_KEY_OPENAI");
+  });
+
+  test("detects AWS access key", () => {
+    const text = `AWS key: ${awsAccessKey}`;
+    const result = detectSecrets(text, apiKeyConfig);
+    expect(result.detected).toBe(true);
+    expect(result.matches).toHaveLength(1);
+    expect(result.matches[0].type).toBe("API_KEY_AWS");
+    expect(result.matches[0].count).toBe(1);
+  });
+
+  test("detects GitHub personal access token", () => {
+    const text = `export GITHUB_TOKEN=${githubToken}`;
+    const result = detectSecrets(text, apiKeyConfig);
+    expect(result.detected).toBe(true);
+    expect(result.matches).toHaveLength(1);
+    expect(result.matches[0].type).toBe("API_KEY_GITHUB");
+  });
+
+  test("detects GitHub OAuth token", () => {
+    const text = `OAuth: ${githubOAuthToken}`;
+    const result = detectSecrets(text, apiKeyConfig);
+    expect(result.detected).toBe(true);
+    expect(result.matches).toHaveLength(1);
+    expect(result.matches[0].type).toBe("API_KEY_GITHUB");
+  });
+
+  test("detects multiple API keys of different types", () => {
+    const text = `OpenAI: ${openaiApiKey}\nAWS: ${awsAccessKey}\nGitHub: ${githubToken}`;
+    const result = detectSecrets(text, apiKeyConfig);
+    expect(result.detected).toBe(true);
+    expect(result.matches).toHaveLength(3);
+    expect(result.matches.find((m) => m.type === "API_KEY_OPENAI")).toBeDefined();
+    expect(result.matches.find((m) => m.type === "API_KEY_AWS")).toBeDefined();
+    expect(result.matches.find((m) => m.type === "API_KEY_GITHUB")).toBeDefined();
+  });
+
+  test("avoids false positive - sk- prefix but too short", () => {
+    const text = "This sk-short is not a valid key";
+    const result = detectSecrets(text, apiKeyConfig);
+    expect(result.detected).toBe(false);
+  });
+
+  test("avoids false positive - AKIA prefix but wrong length", () => {
+    const text = "AKIA12345 is not valid";
+    const result = detectSecrets(text, apiKeyConfig);
+    expect(result.detected).toBe(false);
+  });
+
+  test("avoids false positive - ghp_ prefix but too short", () => {
+    const text = "ghp_tooshort is not valid";
+    const result = detectSecrets(text, apiKeyConfig);
+    expect(result.detected).toBe(false);
+  });
+});
+
+describe("detectSecrets - JWT Tokens", () => {
+  const jwtConfig: SecretsDetectionConfig = {
+    ...defaultConfig,
+    entities: ["JWT_TOKEN"],
+  };
+
+  test("detects JWT token", () => {
+    const text = `Authorization: ${jwtToken}`;
+    const result = detectSecrets(text, jwtConfig);
+    expect(result.detected).toBe(true);
+    expect(result.matches).toHaveLength(1);
+    expect(result.matches[0].type).toBe("JWT_TOKEN");
+    expect(result.matches[0].count).toBe(1);
+  });
+
+  test("detects JWT in JSON context", () => {
+    const text = `{"token": "${jwtToken}"}`;
+    const result = detectSecrets(text, jwtConfig);
+    expect(result.detected).toBe(true);
+    expect(result.matches[0].type).toBe("JWT_TOKEN");
+  });
+
+  test("detects multiple JWT tokens", () => {
+    const text = `Access: ${jwtToken}\nRefresh: ${jwtToken}`;
+    const result = detectSecrets(text, jwtConfig);
+    expect(result.detected).toBe(true);
+    expect(result.matches[0].count).toBe(2);
+  });
+
+  test("avoids false positive - eyJ but incomplete structure", () => {
+    const text = "eyJhbGciOiJIUzI1NiJ9 is not complete";
+    const result = detectSecrets(text, jwtConfig);
+    expect(result.detected).toBe(false);
+  });
+
+  test("avoids false positive - random text with dots", () => {
+    const text = "some.random.text is not a JWT";
+    const result = detectSecrets(text, jwtConfig);
+    expect(result.detected).toBe(false);
+  });
+});
+
+describe("detectSecrets - Bearer Tokens", () => {
+  const bearerConfig: SecretsDetectionConfig = {
+    ...defaultConfig,
+    entities: ["BEARER_TOKEN"],
+  };
+
+  test("detects Bearer token", () => {
+    const text = `Authorization: ${bearerToken}`;
+    const result = detectSecrets(text, bearerConfig);
+    expect(result.detected).toBe(true);
+    expect(result.matches).toHaveLength(1);
+    expect(result.matches[0].type).toBe("BEARER_TOKEN");
+  });
+
+  test("detects bearer token (lowercase)", () => {
+    const text = "bearer abcdefghijklmnopqrstuvwxyz1234567890";
+    const result = detectSecrets(text, bearerConfig);
+    expect(result.detected).toBe(true);
+    expect(result.matches[0].type).toBe("BEARER_TOKEN");
+  });
+
+  test("avoids false positive - Bearer with short token", () => {
+    const text = "Bearer short";
+    const result = detectSecrets(text, bearerConfig);
+    expect(result.detected).toBe(false);
+  });
+});
+
+describe("detectSecrets - Mixed secret types", () => {
+  const allConfig: SecretsDetectionConfig = {
+    ...defaultConfig,
+    entities: [
+      "OPENSSH_PRIVATE_KEY",
+      "PEM_PRIVATE_KEY",
+      "API_KEY_OPENAI",
+      "API_KEY_AWS",
+      "API_KEY_GITHUB",
+      "JWT_TOKEN",
+      "BEARER_TOKEN",
+    ],
+  };
+
+  test("detects multiple secret types in same text", () => {
+    const text = `
+Config file:
+API_KEY=${openaiApiKey}
+AWS_KEY=${awsAccessKey}
+TOKEN=${jwtToken}
+${rsaKey}
+`;
+    const result = detectSecrets(text, allConfig);
+    expect(result.detected).toBe(true);
+    expect(result.matches.length).toBeGreaterThanOrEqual(4);
+  });
+
+  test("redaction positions are correct for all types", () => {
+    const text = `Key: ${awsAccessKey} and ${githubToken}`;
+    const result = detectSecrets(text, allConfig);
+    expect(result.redactions).toBeDefined();
+    expect(result.redactions?.length).toBe(2);
+
+    // Verify redactions point to correct positions
+    for (const redaction of result.redactions || []) {
+      const extracted = text.slice(redaction.start, redaction.end);
+      expect(extracted.length).toBeGreaterThan(10);
+    }
+  });
+});
+
 describe("extractTextFromRequest", () => {
   test("extracts text from simple messages", () => {
     const request: ChatCompletionRequest = {
