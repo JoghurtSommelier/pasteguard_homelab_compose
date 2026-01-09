@@ -3,7 +3,7 @@
 [![CI](https://github.com/sgasser/pasteguard/actions/workflows/ci.yml/badge.svg)](https://github.com/sgasser/pasteguard/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 
-Privacy proxy for LLMs. Masks personal data before sending to your provider (OpenAI, Azure, etc.), or routes sensitive requests to local LLM.
+Privacy proxy for LLMs. Masks personal data and secrets / credentials before sending to your provider (OpenAI, Azure, etc.), or routes sensitive requests to local LLM.
 
 <img src="docs/dashboard.png" width="100%" alt="PasteGuard Dashboard">
 
@@ -35,17 +35,38 @@ Requests with personal data go to local LLM. Everything else goes to your provid
 
 ## What It Detects
 
-| Type | Examples |
-|------|----------|
-| Names | John Smith, Sarah Miller |
-| Emails | john@acme.com |
-| Phone numbers | +1 555 123 4567 |
-| Credit cards | 4111-1111-1111-1111 |
-| IBANs | DE89 3704 0044 0532 0130 00 |
-| IP addresses | 192.168.1.1 |
-| Locations | New York, Berlin |
+### PII (Personal Identifiable Information)
+
+| Type          | Examples                    |
+| ------------- | --------------------------- |
+| Names         | John Smith, Sarah Miller    |
+| Emails        | john@acme.com               |
+| Phone numbers | +1 555 123 4567             |
+| Credit cards  | 4111-1111-1111-1111         |
+| IBANs         | DE89 3704 0044 0532 0130 00 |
+| IP addresses  | 192.168.1.1                 |
+| Locations     | New York, Berlin            |
 
 Additional entity types can be enabled: `US_SSN`, `US_PASSPORT`, `CRYPTO`, `NRP`, `MEDICAL_LICENSE`, `URL`.
+
+### Secrets (Secrets Shield)
+
+| Type                 | Pattern                                                                                                   |
+| -------------------- | --------------------------------------------------------------------------------------------------------- |
+| OpenSSH private keys | `-----BEGIN OPENSSH PRIVATE KEY-----`                                                                     |
+| PEM private keys     | `-----BEGIN RSA PRIVATE KEY-----`, `-----BEGIN PRIVATE KEY-----`, `-----BEGIN ENCRYPTED PRIVATE KEY-----` |
+| OpenAI API keys      | `sk-proj-...`, `sk-...` (48+ chars)                                                                       |
+| AWS access keys      | `AKIA...` (20 chars)                                                                                      |
+| GitHub tokens        | `ghp_...`, `gho_...`, `ghu_...`, `ghs_...`, `ghr_...`                                                      |
+| JWT tokens           | `eyJ...` (three base64 segments)                                                                          |
+| Bearer tokens        | `Bearer ...` (20+ char tokens)                                                                            |
+
+Secrets detection runs **before** PII detection. Three actions available:
+- **block** (default): Returns HTTP 400, request never reaches LLM
+- **redact**: Replaces secrets with placeholders, unredacts in response (reversible)
+- **route_local**: Routes to local LLM (route mode only)
+
+Detected secrets are never logged in their original form.
 
 **Languages**: 24 languages supported (configurable at build time). Auto-detected per request.
 
@@ -110,6 +131,7 @@ LANGUAGES=en,de,fr,it,es docker compose build
 `ca`, `zh`, `hr`, `da`, `nl`, `en`, `fi`, `fr`, `de`, `el`, `it`, `ja`, `ko`, `lt`, `mk`, `nb`, `pl`, `pt`, `ro`, `ru`, `sl`, `es`, `sv`, `uk`
 
 **Language Fallback Behavior:**
+
 - Text language is auto-detected for each request
 - If detected language is not installed, falls back to `fallback_language` (default: `en`)
 - Dashboard shows fallback as `FR→EN` when French text is detected but only English is installed
@@ -137,8 +159,8 @@ providers:
     type: openai
     base_url: https://api.openai.com/v1
 masking:
-  placeholder_format: "<{TYPE}_{N}>"  # Format for masked values
-  show_markers: false                  # Add visual markers to unmasked values
+  placeholder_format: "<{TYPE}_{N}>" # Format for masked values
+  show_markers: false # Add visual markers to unmasked values
 ```
 
 **Route mode:**
@@ -152,24 +174,48 @@ providers:
   local:
     type: ollama
     base_url: http://localhost:11434
-    model: llama3.2                   # Model for all local requests
+    model: llama3.2 # Model for all local requests
 routing:
   default: upstream
   on_pii_detected: local
 ```
 
-**Customize detection:**
+**Customize PII detection:**
 
 ```yaml
 pii_detection:
-  score_threshold: 0.7        # Confidence (0.0 - 1.0)
-  entities:                   # What to detect
+  score_threshold: 0.7 # Confidence (0.0 - 1.0)
+  entities: # What to detect
     - PERSON
     - EMAIL_ADDRESS
     - PHONE_NUMBER
     - CREDIT_CARD
     - IBAN_CODE
 ```
+
+**Secrets detection (Secrets Shield):**
+
+```yaml
+secrets_detection:
+  enabled: true # Enable secrets detection
+  action: block # block | redact | route_local
+  entities: # Secret types to detect
+    - OPENSSH_PRIVATE_KEY
+    - PEM_PRIVATE_KEY
+    # API Keys (opt-in):
+    # - API_KEY_OPENAI
+    # - API_KEY_AWS
+    # - API_KEY_GITHUB
+    # Tokens (opt-in):
+    # - JWT_TOKEN
+    # - BEARER_TOKEN
+  max_scan_chars: 200000 # Performance limit (0 = no limit)
+  log_detected_types: true # Log types (never logs content)
+```
+
+- **block** (default): Returns HTTP 400 error, request never reaches LLM
+- **redact**: Replaces secrets with placeholders, unredacts in response (reversible, like PII masking)
+- **route_local**: Routes to local provider when secrets detected (requires route mode)
 
 **Logging options:**
 
@@ -198,15 +244,15 @@ See [config.example.yaml](config.example.yaml) for all options.
 
 **Endpoints:**
 
-| Endpoint | Description |
-|----------|-------------|
+| Endpoint                           | Description                  |
+| ---------------------------------- | ---------------------------- |
 | `POST /openai/v1/chat/completions` | Chat API (OpenAI-compatible) |
-| `GET /openai/v1/models` | List models |
-| `GET /dashboard` | Monitoring UI |
-| `GET /dashboard/api/logs` | Request logs (JSON) |
-| `GET /dashboard/api/stats` | Statistics (JSON) |
-| `GET /health` | Health check |
-| `GET /info` | Current configuration |
+| `GET /openai/v1/models`            | List models                  |
+| `GET /dashboard`                   | Monitoring UI                |
+| `GET /dashboard/api/logs`          | Request logs (JSON)          |
+| `GET /dashboard/api/stats`         | Statistics (JSON)            |
+| `GET /health`                      | Health check                 |
+| `GET /info`                        | Current configuration        |
 
 **Response headers:**
 
@@ -219,6 +265,9 @@ See [config.example.yaml](config.example.yaml) for all options.
 | `X-PasteGuard-Provider` | `upstream` / `local` |
 | `X-PasteGuard-Language` | Detected language code |
 | `X-PasteGuard-Language-Fallback` | `true` if fallback was used |
+| `X-PasteGuard-Secrets-Detected` | `true` if secrets detected |
+| `X-PasteGuard-Secrets-Types` | Comma-separated list (e.g., `OPENSSH_PRIVATE_KEY,API_KEY_OPENAI`) |
+| `X-PasteGuard-Secrets-Redacted` | `true` if secrets were redacted (action: redact) |
 
 ## Development
 

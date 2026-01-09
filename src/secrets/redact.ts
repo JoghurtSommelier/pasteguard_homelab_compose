@@ -1,0 +1,225 @@
+import type { SecretsDetectionConfig } from "../config";
+import type { ChatCompletionResponse, ChatMessage } from "../services/llm-client";
+import type { SecretsRedaction } from "./detect";
+
+/**
+ * Context for tracking secret redaction mappings
+ * Similar to MaskingContext for PII but for secrets
+ */
+export interface RedactionContext {
+  /** Maps placeholder -> original secret */
+  mapping: Record<string, string>;
+  /** Maps original secret -> placeholder */
+  reverseMapping: Record<string, string>;
+  /** Counter per secret type for sequential numbering */
+  counters: Record<string, number>;
+}
+
+export interface RedactionResult {
+  redacted: string;
+  context: RedactionContext;
+}
+
+/**
+ * Creates a new redaction context for a request
+ */
+export function createRedactionContext(): RedactionContext {
+  return {
+    mapping: {},
+    reverseMapping: {},
+    counters: {},
+  };
+}
+
+/**
+ * Generates a placeholder for a secret type using configured format
+ *
+ * Format: configurable via `redact_placeholder`, default "<SECRET_REDACTED_{N}>"
+ * {N} is replaced with sequential number
+ */
+function generatePlaceholder(
+  secretType: string,
+  context: RedactionContext,
+  config: SecretsDetectionConfig,
+): string {
+  const count = (context.counters[secretType] || 0) + 1;
+  context.counters[secretType] = count;
+
+  // Use configured placeholder format, replace {N} with count
+  // Include type in the placeholder to make it unique per type
+  return config.redact_placeholder.replace("{N}", `${secretType}_${count}`);
+}
+
+/**
+ * Redacts secrets in text, replacing them with placeholders
+ *
+ * Stores mapping in context for later unredaction.
+ * Redactions must be provided sorted by start position descending (as returned by detectSecrets).
+ *
+ * @param text - The text to redact secrets from
+ * @param redactions - Array of redaction positions (sorted by start position descending)
+ * @param config - Secrets detection configuration
+ * @param context - Optional existing context to reuse (for multiple messages)
+ */
+export function redactSecrets(
+  text: string,
+  redactions: SecretsRedaction[],
+  config: SecretsDetectionConfig,
+  context?: RedactionContext,
+): RedactionResult {
+  const ctx = context || createRedactionContext();
+
+  if (redactions.length === 0) {
+    return { redacted: text, context: ctx };
+  }
+
+  // First pass: sort by start position ascending to assign placeholders in order of appearance
+  const sortedByStart = [...redactions].sort((a, b) => a.start - b.start);
+
+  // Assign placeholders in order of appearance
+  const redactionPlaceholders = new Map<SecretsRedaction, string>();
+  for (const redaction of sortedByStart) {
+    const originalValue = text.slice(redaction.start, redaction.end);
+
+    // Check if we already have a placeholder for this exact value
+    let placeholder = ctx.reverseMapping[originalValue];
+
+    if (!placeholder) {
+      placeholder = generatePlaceholder(redaction.type, ctx, config);
+      ctx.mapping[placeholder] = originalValue;
+      ctx.reverseMapping[originalValue] = placeholder;
+    }
+
+    redactionPlaceholders.set(redaction, placeholder);
+  }
+
+  // Second pass: replace from end to start to maintain correct string positions
+  // Redactions should already be sorted by start descending, but re-sort to be safe
+  const sortedByEnd = [...redactions].sort((a, b) => b.start - a.start);
+
+  let result = text;
+  for (const redaction of sortedByEnd) {
+    const placeholder = redactionPlaceholders.get(redaction)!;
+    result = result.slice(0, redaction.start) + placeholder + result.slice(redaction.end);
+  }
+
+  return { redacted: result, context: ctx };
+}
+
+/**
+ * Unredacts text by replacing placeholders with original secrets
+ *
+ * @param text - Text containing secret placeholders
+ * @param context - Redaction context with mappings
+ */
+export function unredactSecrets(text: string, context: RedactionContext): string {
+  let result = text;
+
+  // Sort placeholders by length descending to avoid partial replacements
+  const placeholders = Object.keys(context.mapping).sort((a, b) => b.length - a.length);
+
+  for (const placeholder of placeholders) {
+    const originalValue = context.mapping[placeholder];
+    // Replace all occurrences of the placeholder
+    result = result.split(placeholder).join(originalValue);
+  }
+
+  return result;
+}
+
+/**
+ * Redacts secrets in multiple messages (for chat completions)
+ *
+ * @param messages - Chat messages to redact
+ * @param redactionsByMessage - Redactions for each message (indexed by message position)
+ * @param config - Secrets detection configuration
+ */
+export function redactMessagesSecrets(
+  messages: ChatMessage[],
+  redactionsByMessage: SecretsRedaction[][],
+  config: SecretsDetectionConfig,
+): { redacted: ChatMessage[]; context: RedactionContext } {
+  const context = createRedactionContext();
+
+  const redacted = messages.map((msg, i) => {
+    const redactions = redactionsByMessage[i] || [];
+    const { redacted: redactedContent } = redactSecrets(msg.content, redactions, config, context);
+    return { ...msg, content: redactedContent };
+  });
+
+  return { redacted, context };
+}
+
+/**
+ * Streaming unredact helper - processes chunks and unredacts when complete placeholders are found
+ *
+ * Similar to PII unmasking but for secrets.
+ * Returns the unredacted portion and any remaining buffer that might contain partial placeholders.
+ */
+export function unredactStreamChunk(
+  buffer: string,
+  newChunk: string,
+  context: RedactionContext,
+): { output: string; remainingBuffer: string } {
+  const combined = buffer + newChunk;
+
+  // Find the last safe position to unredact (before any potential partial placeholder)
+  // Look for the start of any potential placeholder pattern
+  const placeholderStart = combined.lastIndexOf("<");
+
+  if (placeholderStart === -1) {
+    // No potential placeholder, safe to unredact everything
+    return {
+      output: unredactSecrets(combined, context),
+      remainingBuffer: "",
+    };
+  }
+
+  // Check if there's a complete placeholder after the last <
+  const afterStart = combined.slice(placeholderStart);
+  const hasCompletePlaceholder = afterStart.includes(">");
+
+  if (hasCompletePlaceholder) {
+    // The placeholder is complete, safe to unredact everything
+    return {
+      output: unredactSecrets(combined, context),
+      remainingBuffer: "",
+    };
+  }
+
+  // Partial placeholder detected, buffer it
+  const safeToProcess = combined.slice(0, placeholderStart);
+  const toBuffer = combined.slice(placeholderStart);
+
+  return {
+    output: unredactSecrets(safeToProcess, context),
+    remainingBuffer: toBuffer,
+  };
+}
+
+/**
+ * Flushes remaining buffer at end of stream
+ */
+export function flushRedactionBuffer(buffer: string, context: RedactionContext): string {
+  if (!buffer) return "";
+  return unredactSecrets(buffer, context);
+}
+
+/**
+ * Unredacts a chat completion response by replacing placeholders in all choices
+ */
+export function unredactResponse(
+  response: ChatCompletionResponse,
+  context: RedactionContext,
+): ChatCompletionResponse {
+  return {
+    ...response,
+    choices: response.choices.map((choice) => ({
+      ...choice,
+      message: {
+        ...choice.message,
+        content: unredactSecrets(choice.message.content, context),
+      },
+    })),
+  };
+}

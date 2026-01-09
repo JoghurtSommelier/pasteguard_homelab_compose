@@ -4,7 +4,13 @@ import { Hono } from "hono";
 import { HTTPException } from "hono/http-exception";
 import { proxy } from "hono/proxy";
 import { z } from "zod";
-import type { MaskingConfig } from "../config";
+import { getConfig, type MaskingConfig, type SecretsDetectionConfig } from "../config";
+import {
+  detectSecrets,
+  extractTextFromRequest,
+  type SecretsDetectionResult,
+} from "../secrets/detect";
+import { type RedactionContext, redactSecrets, unredactResponse } from "../secrets/redact";
 import { getRouter, type MaskDecision, type RoutingDecision } from "../services/decision";
 import type {
   ChatCompletionRequest,
@@ -61,7 +67,8 @@ proxyRoutes.post(
           error: {
             message: "Invalid request body",
             type: "invalid_request_error",
-            details: result.error.errors,
+            param: null,
+            code: null,
           },
         },
         400,
@@ -70,20 +77,160 @@ proxyRoutes.post(
   }),
   async (c) => {
     const startTime = Date.now();
-    const body = c.req.valid("json") as ChatCompletionRequest;
+    let body = c.req.valid("json") as ChatCompletionRequest;
+    const config = getConfig();
     const router = getRouter();
+
+    // Track secrets detection state for response handling
+    let secretsResult: SecretsDetectionResult | undefined;
+    let redactionContext: RedactionContext | undefined;
+    let secretsRedacted = false;
+
+    // Secrets detection runs before PII detection
+    if (config.secrets_detection.enabled) {
+      const text = extractTextFromRequest(body);
+      secretsResult = detectSecrets(text, config.secrets_detection);
+
+      if (secretsResult.detected) {
+        const secretTypes = secretsResult.matches.map((m) => m.type);
+        const secretTypesStr = secretTypes.join(",");
+
+        // Block action - return 400 error
+        if (config.secrets_detection.action === "block") {
+          // Set headers before returning error
+          c.header("X-PasteGuard-Secrets-Detected", "true");
+          c.header("X-PasteGuard-Secrets-Types", secretTypesStr);
+
+          // Log metadata only (no secret content)
+          logRequest(
+            {
+              timestamp: new Date().toISOString(),
+              mode: config.mode,
+              provider: "upstream", // Note: Request never reached provider
+              model: body.model || "unknown",
+              piiDetected: false,
+              entities: [],
+              latencyMs: Date.now() - startTime,
+              scanTimeMs: 0,
+              language: config.pii_detection.fallback_language,
+              languageFallback: false,
+              secretsDetected: true,
+              secretsTypes: secretTypes,
+            },
+            c.req.header("User-Agent") || null,
+          );
+
+          return c.json(
+            {
+              error: {
+                message: `Request blocked: detected secret material (${secretTypesStr}). Remove secrets and retry.`,
+                type: "invalid_request_error",
+                param: null,
+                code: "secrets_detected",
+              },
+            },
+            400,
+          );
+        }
+
+        // Redact action - replace secrets with placeholders and continue
+        if (config.secrets_detection.action === "redact") {
+          const redactedMessages = redactMessagesWithSecrets(
+            body.messages,
+            secretsResult,
+            config.secrets_detection,
+          );
+          body = { ...body, messages: redactedMessages.messages };
+          redactionContext = redactedMessages.context;
+          secretsRedacted = true;
+        }
+
+        // route_local action is handled in handleCompletion via secretsResult
+      }
+    }
 
     let decision: RoutingDecision;
     try {
-      decision = await router.decide(body.messages);
+      decision = await router.decide(body.messages, secretsResult);
     } catch (error) {
       console.error("PII detection error:", error);
       throw new HTTPException(503, { message: "PII detection service unavailable" });
     }
 
-    return handleCompletion(c, body, decision, startTime, router);
+    return handleCompletion(
+      c,
+      body,
+      decision,
+      startTime,
+      router,
+      secretsResult,
+      redactionContext,
+      secretsRedacted,
+    );
   },
 );
+
+/**
+ * Redacts secrets in all messages based on detection result
+ * Returns redacted messages and the redaction context for unredaction
+ */
+function redactMessagesWithSecrets(
+  messages: ChatMessage[],
+  secretsResult: SecretsDetectionResult,
+  config: SecretsDetectionConfig,
+): { messages: ChatMessage[]; context: RedactionContext } {
+  // Build a map of message content to redactions
+  // Since we concatenated all messages with \n, we need to track positions per message
+  let currentOffset = 0;
+  const messagePositions: { start: number; end: number }[] = [];
+
+  for (const msg of messages) {
+    const length = typeof msg.content === "string" ? msg.content.length : 0;
+    messagePositions.push({ start: currentOffset, end: currentOffset + length });
+    currentOffset += length + 1; // +1 for \n separator
+  }
+
+  // Create redaction context
+  let context: RedactionContext = {
+    mapping: {},
+    reverseMapping: {},
+    counters: {},
+  };
+
+  // Apply redactions to each message
+  const redactedMessages = messages.map((msg, i) => {
+    if (typeof msg.content !== "string" || !msg.content) {
+      return msg;
+    }
+
+    const msgPos = messagePositions[i];
+
+    // Filter redactions that fall within this message's position
+    const messageRedactions = (secretsResult.redactions || [])
+      .filter((r) => r.start >= msgPos.start && r.end <= msgPos.end)
+      .map((r) => ({
+        ...r,
+        start: r.start - msgPos.start,
+        end: r.end - msgPos.start,
+      }));
+
+    if (messageRedactions.length === 0) {
+      return msg;
+    }
+
+    const { redacted, context: updatedContext } = redactSecrets(
+      msg.content,
+      messageRedactions,
+      config,
+      context,
+    );
+    context = updatedContext;
+
+    return { ...msg, content: redacted };
+  });
+
+  return { messages: redactedMessages, context };
+}
 
 /**
  * Handle chat completion for both route and mask modes
@@ -94,6 +241,9 @@ async function handleCompletion(
   decision: RoutingDecision,
   startTime: number,
   router: ReturnType<typeof getRouter>,
+  secretsResult?: SecretsDetectionResult,
+  redactionContext?: RedactionContext,
+  secretsRedacted?: boolean,
 ) {
   const client = router.getClient(decision.provider);
   const maskingConfig = router.getMaskingConfig();
@@ -111,13 +261,37 @@ async function handleCompletion(
   try {
     const result = await client.chatCompletion(request, authHeader);
 
-    setPasteGuardHeaders(c, decision);
+    // Determine secrets state from passed result
+    const secretsDetected = secretsResult?.detected ?? false;
+    const secretsTypes = secretsResult?.matches.map((m) => m.type) ?? [];
+
+    setPasteGuardHeaders(c, decision, secretsDetected, secretsTypes, secretsRedacted);
 
     if (result.isStreaming) {
-      return handleStreamingResponse(c, result, decision, startTime, maskedContent, maskingConfig);
+      return handleStreamingResponse(
+        c,
+        result,
+        decision,
+        startTime,
+        maskedContent,
+        maskingConfig,
+        secretsDetected,
+        secretsTypes,
+        redactionContext,
+      );
     }
 
-    return handleJsonResponse(c, result, decision, startTime, maskedContent, maskingConfig);
+    return handleJsonResponse(
+      c,
+      result,
+      decision,
+      startTime,
+      maskedContent,
+      maskingConfig,
+      secretsDetected,
+      secretsTypes,
+      redactionContext,
+    );
   } catch (error) {
     console.error("LLM request error:", error);
     const message = error instanceof Error ? error.message : "Unknown error";
@@ -128,7 +302,13 @@ async function handleCompletion(
 /**
  * Set X-PasteGuard response headers
  */
-function setPasteGuardHeaders(c: Context, decision: RoutingDecision) {
+function setPasteGuardHeaders(
+  c: Context,
+  decision: RoutingDecision,
+  secretsDetected?: boolean,
+  secretsTypes?: string[],
+  secretsRedacted?: boolean,
+) {
   c.header("X-PasteGuard-Mode", decision.mode);
   c.header("X-PasteGuard-Provider", decision.provider);
   c.header("X-PasteGuard-PII-Detected", decision.piiResult.hasPII.toString());
@@ -138,6 +318,13 @@ function setPasteGuardHeaders(c: Context, decision: RoutingDecision) {
   }
   if (decision.mode === "mask") {
     c.header("X-PasteGuard-PII-Masked", decision.piiResult.hasPII.toString());
+  }
+  if (secretsDetected && secretsTypes && secretsTypes.length > 0) {
+    c.header("X-PasteGuard-Secrets-Detected", "true");
+    c.header("X-PasteGuard-Secrets-Types", secretsTypes.join(","));
+  }
+  if (secretsRedacted) {
+    c.header("X-PasteGuard-Secrets-Redacted", "true");
   }
 }
 
@@ -151,9 +338,20 @@ function handleStreamingResponse(
   startTime: number,
   maskedContent: string | undefined,
   maskingConfig: MaskingConfig,
+  secretsDetected?: boolean,
+  secretsTypes?: string[],
+  redactionContext?: RedactionContext,
 ) {
   logRequest(
-    createLogData(decision, result, startTime, undefined, maskedContent),
+    createLogData(
+      decision,
+      result,
+      startTime,
+      undefined,
+      maskedContent,
+      secretsDetected,
+      secretsTypes,
+    ),
     c.req.header("User-Agent") || null,
   );
 
@@ -161,11 +359,16 @@ function handleStreamingResponse(
   c.header("Cache-Control", "no-cache");
   c.header("Connection", "keep-alive");
 
-  if (isMaskDecision(decision)) {
+  // Determine if we need to transform the stream
+  const needsPIIUnmasking = isMaskDecision(decision);
+  const needsSecretsUnredaction = redactionContext !== undefined;
+
+  if (needsPIIUnmasking || needsSecretsUnredaction) {
     const unmaskingStream = createUnmaskingStream(
       result.response,
-      decision.maskingContext,
+      needsPIIUnmasking ? decision.maskingContext : undefined,
       maskingConfig,
+      redactionContext,
     );
     return c.body(unmaskingStream);
   }
@@ -183,17 +386,36 @@ function handleJsonResponse(
   startTime: number,
   maskedContent: string | undefined,
   maskingConfig: MaskingConfig,
+  secretsDetected?: boolean,
+  secretsTypes?: string[],
+  redactionContext?: RedactionContext,
 ) {
   logRequest(
-    createLogData(decision, result, startTime, result.response, maskedContent),
+    createLogData(
+      decision,
+      result,
+      startTime,
+      result.response,
+      maskedContent,
+      secretsDetected,
+      secretsTypes,
+    ),
     c.req.header("User-Agent") || null,
   );
 
+  let response = result.response;
+
+  // First unmask PII if needed
   if (isMaskDecision(decision)) {
-    return c.json(unmaskResponse(result.response, decision.maskingContext, maskingConfig));
+    response = unmaskResponse(response, decision.maskingContext, maskingConfig);
   }
 
-  return c.json(result.response);
+  // Then unredact secrets if needed
+  if (redactionContext) {
+    response = unredactResponse(response, redactionContext);
+  }
+
+  return c.json(response);
 }
 
 /**
@@ -205,6 +427,8 @@ function createLogData(
   startTime: number,
   response?: ChatCompletionResponse,
   maskedContent?: string,
+  secretsDetected?: boolean,
+  secretsTypes?: string[],
 ): RequestLogData {
   return {
     timestamp: new Date().toISOString(),
@@ -221,6 +445,8 @@ function createLogData(
     languageFallback: decision.piiResult.languageFallback,
     detectedLanguage: decision.piiResult.detectedLanguage,
     maskedContent,
+    secretsDetected,
+    secretsTypes,
   };
 }
 
