@@ -125,7 +125,9 @@ secrets_detection:
     # - BEARER_TOKEN
 
   # Maximum characters to scan per request (performance limit)
-  # Set to 0 to scan entire request (not recommended for large payloads)
+  # Note: Secrets placed after this limit won't be detected.
+  # Set to 0 to scan entire request (full coverage, but slower for large payloads)
+  # The 200KB default covers typical use cases
   max_scan_chars: 200000
 
   # Placeholder format for redaction (only used if action: redact)
