@@ -24,7 +24,7 @@ services:
         #            lt, mk, nb, pl, pt, ro, ru, sl, es, sv, uk
         # See presidio/languages.yaml for full list
         # Example: LANGUAGES=en,de,fr docker-compose build
-        LANGUAGES: ${LANGUAGES:-en}
+        LANGUAGES: ${LANGUAGES:-en,de}
     ports:
       - "9832:3000"
     healthcheck:
