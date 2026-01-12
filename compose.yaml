@@ -6,7 +6,7 @@ services:
     env_file:
       - .env
     environment:
-      - PRESIDIO_URL=http://localhost:9832
+      - PRESIDIO_URL=http://192.168.2.228:9832
     volumes:
       - /mnt/user/appdata/docker/pasteguard/config.yaml:/app/config.yaml:ro
       - /mnt/user/appdata/docker/pasteguard/data:/app/data
