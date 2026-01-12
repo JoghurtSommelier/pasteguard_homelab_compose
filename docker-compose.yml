@@ -2,14 +2,14 @@ services:
   pasteguard:
     build: .
     ports:
-      - "3000:3000"
+      - "9382:3000"
     env_file:
       - .env
     environment:
-      - PRESIDIO_URL=http://presidio-analyzer:3000
+      - PRESIDIO_URL=http://localhost:9832
     volumes:
-      - ./config.yaml:/app/config.yaml:ro
-      - ./data:/app/data
+      - /mnt/user/appdata/docker/pasteguard/config.yaml:/app/config.yaml:ro
+      - /mnt/user/appdata/docker/pasteguard/data:/app/data
     depends_on:
       presidio-analyzer:
         condition: service_healthy
@@ -26,7 +26,7 @@ services:
         # Example: LANGUAGES=en,de,fr docker-compose build
         LANGUAGES: ${LANGUAGES:-en}
     ports:
-      - "5002:3000"
+      - "9832:3000"
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:3000/health')"]
       interval: 30s
